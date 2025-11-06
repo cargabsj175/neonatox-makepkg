@@ -4,6 +4,17 @@ set -euo pipefail
 # === Opciones de línea de comandos ===
 workdir="$PWD"
 printsrcinfo=false
+noarchive=false
+ver="n2026"
+
+function version(){
+	echo "$(basename $0) (nhopkg) $ver"
+	echo "Copyright (C) 2007-2025 Carlos Sanchez <cargabsj175@gmail.com>."
+	echo ""
+	echo "This is free software; see the source for copying conditions."
+	echo "There is NO WARRANTY, to the extent permitted by law."
+	exit 1
+	}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -15,10 +26,32 @@ while [[ $# -gt 0 ]]; do
             workdir="$2"
             shift 2
             ;;
+        --noarchive)
+			noarchive=true
+			shift
+			;;
         --printsrcinfo)
             printsrcinfo=true
             shift
             ;;
+        -h|--help)
+			echo "$(basename $0) (nhopkg) $ver"
+			echo ""
+			echo "Pure bash tool to build PKGBUILD using nhopkg"
+			echo ""
+			echo "Usage: $(basename $0) [options]"
+			echo ""
+			echo "Options:"
+			echo "-D, --dir <dir>  Change to directory <dir> before processing PKGBUILD"
+			echo "-h, --help       Show this help message and exit"
+			echo "-V, --version    Show version information and exit"
+			echo "--noarchive      Do not create package archive"
+			echo "--printsrcinfo   Print the generated SRCINFO and exit"
+			exit 1
+			;;
+		-V|--version)
+			version
+			;;
         *)
             echo "Opción desconocida: $1" >&2
             exit 1
@@ -214,8 +247,7 @@ options = purge
 options = debug
 options = lto
 EOF
-	}
-
+}
 
 # Validar metadatos básicos
 [[ -z ${pkgname:-} ]] && error "pkgname no definido."
@@ -288,7 +320,6 @@ download_source() {
         error "Fuente no soportada: $src (solo local, https://, git+https://)"
     fi
 }
-
 
 # === FUNCIÓN: extraer archivos comprimidos ===
 extract_sources() {
@@ -440,6 +471,13 @@ else
     log "Advertencia: bsdtar no encontrado. El paquete no tendrá .MTREE."
 fi
 
+
+if [[ "$noarchive" == true ]]; then
+    log "Opción --noarchive activada: se omite la creación del paquete."
+    log "${GREEN}Build completado sin generar .pkg.tar.zst${NC}"
+    exit 0
+fi
+
 # Empaquetar
 log "Creando paquete: $pkgfile"
 if command -v bsdtar >/dev/null; then
@@ -457,6 +495,5 @@ else
         exit 1
     }
 fi
-
 
 log "${GREEN}¡Paquete creado con éxito!${NC} -> $pkgfile"
