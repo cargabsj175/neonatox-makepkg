@@ -5,6 +5,7 @@ set -euo pipefail
 workdir="$PWD"
 printsrcinfo=false
 noarchive=false
+skipchecksums=false
 ver="n2026"
 
 function version(){
@@ -12,7 +13,7 @@ function version(){
 	echo "Copyright (C) 2007-2025 Carlos Sanchez <cargabsj175@gmail.com>."
 	echo ""
 	echo "This is free software; see the source for copying conditions."
-	echo "There is NO WARRANTY, to the extent permitted by law."
+	echo "There IS NO WARRANTY, to the extent permitted by law."
 	exit 1
 	}
 
@@ -28,6 +29,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --noarchive)
 			noarchive=true
+			shift
+			;;
+		--skipchecksums)
+			skipchecksums=true
 			shift
 			;;
         --printsrcinfo)
@@ -46,6 +51,7 @@ while [[ $# -gt 0 ]]; do
 			echo "-h, --help       Show this help message and exit"
 			echo "-V, --version    Show version information and exit"
 			echo "--noarchive      Do not create package archive"
+			echo "--skipchecksums  Do not verify downloaded source checksums"
 			echo "--printsrcinfo   Print the generated SRCINFO and exit"
 			exit 1
 			;;
@@ -63,7 +69,7 @@ done
 cd "$workdir"
 
 # Directorios de trabajo (relativos al directorio de trabajo)
-readonly SRCDIR="$PWD/src"
+SRCDIR="$PWD/src"
 readonly BUILDDIR="$PWD/build"
 readonly PKGDIR="$PWD/pkg"
 readonly PKGEXT=".pkg.tar.zst"
@@ -231,7 +237,7 @@ builddate = $BUILDDATE
 builddir = $workdir
 startdir = $workdir
 buildtool = $(basename $0)
-buildtoolver = 0.5
+buildtoolver = $ver
 buildenv = !distcc
 buildenv = color
 buildenv = !ccache
@@ -254,12 +260,165 @@ EOF
 [[ -z ${pkgver:-} ]] && error "pkgver no definido."
 [[ -z ${pkgrel:-} ]] && error "pkgrel no definido."
 
-readonly pkgfile="${pkgname}-${pkgver}-${pkgrel}${PKGEXT}"
+readonly pkgfile="${pkgname}-${pkgver}-${pkgrel}-${CARCH}${PKGEXT}"
 
 # Limpiar entorno
 log "Limpiando directorios anteriores..."
 rm -rf "$SRCDIR" "$BUILDDIR" "$PKGDIR"
 mkdir -p "$SRCDIR" "$BUILDDIR" "$PKGDIR"
+
+# ============================
+# FUNCIÓN: verificar checksums
+# ============================
+# Verifica sha256, sha512 o b2 (blake2b) para el archivo dado.
+# Usa arrays declaradas en PKGBUILD (sha256sums, sha512sums, b2sums,
+# y sus variantes por arquitectura sha256sums_x86_64, etc.)
+#
+# Recibe:
+#   $1 -> ruta completa del archivo en SRCDIR (o directo si es local)
+#   $2 -> la entrada original de source (ej: "foo.tar.gz" o "name::https://...")
+verify_checksum() {
+    local filepath="$1"
+    local srcentry="$2"
+
+    # Si se pidió saltar verificaciones
+    if [[ "$skipchecksums" == true ]]; then
+        log "Saltando verificación de checksums para $filepath (opción --skipchecksums)"
+        return 0
+    fi
+
+    # Si no existe el archivo regular (por ejemplo un repositorio clonado -> directorio), saltar
+    if [[ ! -f "$filepath" ]]; then
+        log "No es un fichero regular, saltando checksum: $filepath"
+        return 0
+    fi
+
+    # Determinar el índice de la entrada dentro de la(s) arrays de source.
+    local idx=-1
+    local srcarray=""
+    # Buscar en source[]
+    if [[ -v source ]]; then
+        for i in "${!source[@]}"; do
+            if [[ "${source[$i]}" == "$srcentry" ]]; then
+                idx=$i
+                srcarray="source"
+                break
+            fi
+        done
+    fi
+    # Si no encontrado, buscar en source_x86_64 o source_aarch64 si aplicable
+    if [[ $idx -eq -1 && "$CARCH" == "x86_64" && -v source_x86_64 ]]; then
+        for i in "${!source_x86_64[@]}"; do
+            if [[ "${source_x86_64[$i]}" == "$srcentry" ]]; then
+                idx=$i
+                srcarray="source_x86_64"
+                break
+            fi
+        done
+    fi
+    if [[ $idx -eq -1 && "$CARCH" == "aarch64" && -v source_aarch64 ]]; then
+        for i in "${!source_aarch64[@]}"; do
+            if [[ "${source_aarch64[$i]}" == "$srcentry" ]]; then
+                idx=$i
+                srcarray="source_aarch64"
+                break
+            fi
+        done
+    fi
+
+    # Si no se encontró la entrada, informar y omitir verificación
+    if [[ $idx -eq -1 ]]; then
+        log "No se encontró la entrada correspondiente en arrays source[] para: $srcentry — omitiendo checksum."
+        return 0
+    fi
+
+    # Obtener suma esperada (priorizar arrays por arquitectura cuando corresponda)
+    local expected=""
+    # helper para obtener elemento seguro
+    _arr_get() {
+        local arrname="$1"; local pos="$2"
+        if eval '[[ -v '"$arrname"' ]]' 2>/dev/null; then
+            eval "local -a __a=(\"\${${arrname}[@]}\")"
+            if [[ $pos -ge 0 && $pos -lt ${#__a[@]} ]]; then
+                echo "${__a[$pos]}"
+                return 0
+            fi
+        fi
+        return 1
+    }
+
+    if [[ "${srcarray}" == "source_x86_64" ]]; then
+        # primero las sums específicas de x86_64
+        expected="$(_arr_get sha256sums_x86_64 "$idx")" || true
+        if [[ -z "$expected" ]]; then expected="$(_arr_get sha512sums_x86_64 "$idx")" || true; fi
+        if [[ -z "$expected" ]]; then expected="$(_arr_get b2sums_x86_64 "$idx")" || true; fi
+
+        # fallback a genérico si no hay específica
+        if [[ -z "$expected" ]]; then
+            expected="$(_arr_get sha256sums "$idx")" || true
+            if [[ -z "$expected" ]]; then expected="$(_arr_get sha512sums "$idx")" || true; fi
+            if [[ -z "$expected" ]]; then expected="$(_arr_get b2sums "$idx")" || true; fi
+        fi
+
+    elif [[ "${srcarray}" == "source_aarch64" ]]; then
+        # primero las sums específicas de aarch64
+        expected="$(_arr_get sha256sums_aarch64 "$idx")" || true
+        if [[ -z "$expected" ]]; then expected="$(_arr_get sha512sums_aarch64 "$idx")" || true; fi
+        if [[ -z "$expected" ]]; then expected="$(_arr_get b2sums_aarch64 "$idx")" || true; fi
+
+        # fallback a genérico si no hay específica
+        if [[ -z "$expected" ]]; then
+            expected="$(_arr_get sha256sums "$idx")" || true
+            if [[ -z "$expected" ]]; then expected="$(_arr_get sha512sums "$idx")" || true; fi
+            if [[ -z "$expected" ]]; then expected="$(_arr_get b2sums "$idx")" || true; fi
+        fi
+
+    else
+        # Caso por defecto: arrays genéricos
+        expected="$(_arr_get sha256sums "$idx")" || true
+        if [[ -z "$expected" ]]; then expected="$(_arr_get sha512sums "$idx")" || true; fi
+        if [[ -z "$expected" ]]; then expected="$(_arr_get b2sums "$idx")" || true; fi
+    fi
+
+    # Si no hay suma esperada o es "SKIP", saltar
+    if [[ -z "$expected" || "$expected" == "SKIP" || "$expected" == $'SKIP\n' ]]; then
+        log "No hay checksum declarado (o es SKIP) para $filepath — se omite verificación."
+        return 0
+    fi
+
+    # Normalizar expected (puede venir con espacios)
+    expected="$(echo -n "$expected" | tr -d '[:space:]')"
+
+    # Calcular sumas disponibles
+    local computed=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        computed="$(sha256sum "$filepath" | awk '{print $1}')"
+        if [[ "$computed" == "$expected" ]]; then
+            log "sha256 OK: $(basename "$filepath")"
+            return 0
+        fi
+    fi
+
+    if command -v sha512sum >/dev/null 2>&1; then
+        computed="$(sha512sum "$filepath" | awk '{print $1}')"
+        if [[ "$computed" == "$expected" ]]; then
+            log "sha512 OK: $(basename "$filepath")"
+            return 0
+        fi
+    fi
+
+    # b2sum (blake2b)
+    if command -v b2sum >/dev/null 2>&1; then
+        computed="$(b2sum "$filepath" | awk '{print $1}')"
+        if [[ "$computed" == "$expected" ]]; then
+            log "b2 (blake2b) OK: $(basename "$filepath")"
+            return 0
+        fi
+    fi
+
+    # Si llegamos acá, ninguna coincide
+    error "Checksum mismatch para $(basename "$filepath"). Esperado: $expected. Computado: $computed"
+}
 
 # === FUNCIÓN: descargar o copiar fuente ===
 download_source() {
@@ -280,11 +439,13 @@ download_source() {
         [[ -f "$url" ]] || error "Archivo local no encontrado: $url"
         log "Copiando archivo local: $url → $filename"
         cp "$url" "$SRCDIR/$filename"
+        # Verificar checksum del archivo copiado (si aplica)
+        verify_checksum "$SRCDIR/$filename" "$src"
         return
     fi
 
     # Descarga vía HTTPS
-    if [[ "$url" == https://* ]]; then
+    if [[ "$url" == http*://* ]]; then
         log "Descargando: $url → $filename"
         if command -v curl >/dev/null; then
             curl -Lf -o "$SRCDIR/$filename" "$url"
@@ -293,7 +454,8 @@ download_source() {
         else
             error "Necesitas curl o wget para descargar."
         fi
-
+	# Verificar checksum del archivo descargado (si aplica)
+	    verify_checksum "$SRCDIR/$filename" "$src"
     # Repositorios Git
     elif [[ "$url" == git+https://* ]]; then
         local full_url="${url#git+}"
@@ -317,23 +479,40 @@ download_source() {
             git clone --depth=1 "$url_base" "$SRCDIR/$repo_name"
         fi
     else
-        error "Fuente no soportada: $src (solo local, https://, git+https://)"
+        error "Fuente no soportada: $src (solo local, http://, https://, git+https://)"
     fi
 }
 
 # === FUNCIÓN: extraer archivos comprimidos ===
 extract_sources() {
     local extracted=false
-    local skiplist=()
+    local -a skiplist
+    local -a files
+
+    # Asegurar SRCDIR por defecto (igual que makepkg)
+    SRCDIR="${SRCDIR:-${PWD}/src}"
+    mkdir -p "$SRCDIR"
 
     # Si noextract está definido, guardamos los nombres a omitir
     if [[ -v noextract && ${#noextract[@]} -gt 0 ]]; then
-        skiplist=("${noextract[@]}")
+        skiplist=( "${noextract[@]}" )
     fi
 
-    for f in "$SRCDIR"/*; do
+    # Tomar "foto" de los archivos que hay ahora en SRCDIR para evitar procesar artefactos creados durante la extracción
+    # Usamos nullglob en una subshell para evitar cambiar el shell globalmente
+    readarray -t files < <(
+        bash -c 'shopt -s nullglob; for f in "$1"/*; do printf "%s\n" "$f"; done' -- "$SRCDIR"
+    )
+
+    for f in "${files[@]}"; do
         [[ -e "$f" ]] || continue
         local filename=$(basename "$f")
+
+        # Sólo procesar archivos regulares (evitar directorios)
+        if [[ ! -f "$f" ]]; then
+            log "Saltando $filename (no es archivo regular)"
+            continue
+        fi
 
         # Omitir si está en noextract[]
         if [[ " ${skiplist[*]} " == *" ${filename} "* ]]; then
@@ -344,27 +523,35 @@ extract_sources() {
         case "$f" in
             *.tar.gz|*.tgz)
                 log "Extrayendo $filename"
-                tar -xzf "$f" -C "$SRCDIR"
+                tar -xzf "$f" -C "$SRCDIR" || { log "ERROR: falló tar -xzf $filename"; return 1; }
                 extracted=true
                 ;;
             *.tar.xz|*.txz)
                 log "Extrayendo $filename"
-                tar -xJf "$f" -C "$SRCDIR"
+                tar -xJf "$f" -C "$SRCDIR" || { log "ERROR: falló tar -xJf $filename"; return 1; }
                 extracted=true
                 ;;
             *.tar.bz2|*.tbz2)
                 log "Extrayendo $filename"
-                tar -xjf "$f" -C "$SRCDIR"
+                tar -xjf "$f" -C "$SRCDIR" || { log "ERROR: falló tar -xjf $filename"; return 1; }
                 extracted=true
                 ;;
             *.tar.zst)
                 log "Extrayendo $filename"
-                zstd -dc "$f" | tar -xf - -C "$SRCDIR"
+                if ! command -v zstd >/dev/null 2>&1; then
+                    log "ERROR: zstd no está disponible para descomprimir $filename"
+                    return 1
+                fi
+                zstd -dc "$f" | tar -xf - -C "$SRCDIR" || { log "ERROR: falló descompresión zstd|tar para $filename"; return 1; }
                 extracted=true
                 ;;
             *.zip)
                 log "Extrayendo $filename"
-                unzip -q "$f" -d "$SRCDIR"
+                if ! command -v unzip >/dev/null 2>&1; then
+                    log "ERROR: unzip no está disponible para descomprimir $filename"
+                    return 1
+                fi
+                unzip -q "$f" -d "$SRCDIR" || { log "ERROR: falló unzip $filename"; return 1; }
                 extracted=true
                 ;;
             *)
@@ -373,8 +560,16 @@ extract_sources() {
         esac
     done
 
-    [[ "$extracted" == false ]] && log "No se extrajeron archivos (todos estaban en noextract o no eran comprimidos)."
+    if [[ "$extracted" == false ]]; then
+        log "No se extrajeron archivos (todos estaban en noextract o no eran comprimidos)."
+    else
+        # Mostrar árbol resultante para facilitar debugging (igual que makepkg suele listar)
+        #log "Contenido de $SRCDIR tras la extracción:"
+        #find "$SRCDIR" -maxdepth 3 -mindepth 1 -print || true
+        echo ""
+    fi
 }
+
 
 # === PROCESO PRINCIPAL ===
 
@@ -460,7 +655,7 @@ log "Generando metadatos (.PKGINFO)..."
 generate_pkginfo > "$PKGDIR/.PKGINFO"
 
 log "Generando metadatos (.BUILDINFO)..."
-generate_srcinfo > "$PKGDIR/.BUILDINFO"
+generate_pkgbuild > "$PKGDIR/.BUILDINFO"
 
 
 # .MTREE (mejor compatibilidad con pacman)
@@ -483,14 +678,14 @@ log "Creando paquete: $pkgfile"
 if command -v bsdtar >/dev/null; then
     ( cd "$PKGDIR" && \
       find . -mindepth 1 -maxdepth 1 -printf '%P\0' | \
-      bsdtar -c --zstd -f "$pkgfile" --null -T - ) || {
+      bsdtar -c --zstd -f "$workdir/$pkgfile" --null -T - ) || {
         log "Error: falló bsdtar"
         exit 1
     }
 else
     ( cd "$PKGDIR" && \
       find . -mindepth 1 -maxdepth 1 -printf '%P\0' | \
-      tar -c --null -T - | zstd -o "$pkgfile" ) || {
+      tar -c --null -T - | zstd -o "$workdir/$pkgfile" ) || {
         log "Error: falló tar + zstd"
         exit 1
     }
