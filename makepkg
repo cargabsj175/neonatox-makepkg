@@ -1,15 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+
 # === Opciones de línea de comandos ===
 workdir="$PWD"
 printsrcinfo=false
 noarchive=false
 skipchecksums=false
-ver="n2026"
+# === Si esta dentro de nhopkg usar la version de nhopkg ===
+if [ -z "${NHOPKG_VERSION+x}" ]; then
+	ver="n2026"
+else
+	ver="$NHOPKG_VERSION"
+fi
 
-function version(){
-	echo "$(basename $0) (nhopkg) $ver"
+function license(){
+	echo "$(basename $0) $ver (makepkg)"
 	echo "Copyright (C) 2007-2025 Carlos Sanchez <cargabsj175@gmail.com>."
 	echo ""
 	echo "This is free software; see the source for copying conditions."
@@ -40,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-			echo "$(basename $0) (nhopkg) $ver"
+			echo "$(basename $0) $ver (makepkg)"
 			echo ""
 			echo "Pure bash tool to build PKGBUILD using nhopkg"
 			echo ""
@@ -56,7 +62,7 @@ while [[ $# -gt 0 ]]; do
 			exit 1
 			;;
 		-V|--version)
-			version
+			license
 			;;
         *)
             echo "Opción desconocida: $1" >&2
@@ -70,10 +76,10 @@ cd "$workdir"
 
 # Directorios de trabajo (relativos al directorio de trabajo)
 SRCDIR="$PWD/src"
-readonly BUILDDIR="$PWD/build"
-readonly PKGDIR="$PWD/pkg"
-readonly PKGEXT=".pkg.tar.zst"
-readonly CARCH="$(uname -m)"
+BUILDDIR="$PWD/build"
+PKGDIR="$PWD/pkg"
+PKGEXT=".pkg.tar.zst"
+CARCH="$(uname -m)"
 
 # Colores
 RED='\033[0;31m'
@@ -98,7 +104,7 @@ PKGBUILDSHA256=$(sha256sum PKGBUILD | sed 's/ PKGBUILD//g')
 BUILDDATE=$(date +%s)
 PACKAGETYPE=$(cat PKGBUILD | grep package | sed 's/ {//g')
 
-log "Cargando PKGBUILD..."
+#log "Cargando PKGBUILD..."
 source PKGBUILD
 
 # Verificar la condición
@@ -106,6 +112,42 @@ if [ "$PACKAGETYPE" != "package()" ]; then
     echo "Error: $(basename $0) only supports non-split PKGBUILD files..."
     exit 1
 fi
+
+SPLITPACKAGE=""
+# 1) Si hay función package() definida -> paquete simple
+if declare -f package >/dev/null 2>&1; then
+    SPLITPACKAGE=""
+else
+    # 2) Si hay funciones package_<name> ya declaradas -> tomar nombres
+    #    (esto cubre PKGBUILD que definen package_... literalmente)
+    mapfile -t _pkgfuncs < <(declare -F | awk '{print $3}' | grep -E '^package_' || true)
+    if [[ ${#_pkgfuncs[@]} -gt 0 ]]; then
+        # Extraer sufijos "package_foo" -> "foo"
+        for f in "${_pkgfuncs[@]}"; do
+            SPLITPACKAGE+=" ${f#package_}"
+        done
+    else
+        # 3) Si pkgname es un array con más de 1 elemento -> split package
+        if eval '[[ $(declare -p pkgname 2>/dev/null) =~ "declare -a" ]]' && [[ "${#pkgname[@]}" -gt 1 ]]; then
+            # expandir los nombres tal como quedaron tras source PKGBUILD
+            for p in "${pkgname[@]}"; do
+                SPLITPACKAGE+=" $p"
+            done
+        else
+            # 4) Fallback: buscar literal "package_" en el PKGBUILD (por si usan defs textuales)
+            if grep -q -E '^[[:space:]]*package_[A-Za-z0-9_.-]*\(\)' PKGBUILD 2>/dev/null; then
+                mapfile -t _lines < <(grep -E '^[[:space:]]*package_[A-Za-z0-9_.-]*\(\)' PKGBUILD | sed -E 's/^[[:space:]]*package_([A-Za-z0-9_.-]*)\(\).*/\1/')
+                for p in "${_lines[@]}"; do
+                    SPLITPACKAGE+=" $p"
+                done
+            else
+                SPLITPACKAGE=""
+            fi
+        fi
+    fi
+fi
+# trim leading spaces
+SPLITPACKAGE="${SPLITPACKAGE#"${SPLITPACKAGE%%[![:space:]]*}"}"
 
 ##############################
 # Funciones para metapaquetes
@@ -125,16 +167,31 @@ generate_srcinfo() {
     }
     cat <<EOF
 pkgbase = ${pkgbase:-$pkgname}
-	pkgdesc = $pkgdesc
-	url = $url
 EOF
-	print_array_field "arch" "arch"
+	if [ -n "${pkgdesc+x}" ]; then
+    cat <<EOF
+	pkgdesc = $pkgdesc
+EOF
+	fi
 	cat <<EOF
 	pkgver = $pkgver
 	pkgrel = $pkgrel
-	epoch = ${epoch:-1}
-	packager = ${packager:-$(whoami)}
 EOF
+	cat <<EOF
+	url = $url
+EOF
+	print_array_field "arch" "arch"
+	print_array_field "groups" "groups"
+	if [ -n "${epoch+x}" ]; then
+    cat <<EOF
+	epoch = $epoch
+EOF
+	fi
+	if [ -n "${packager+x}" ]; then
+	cat <<EOF
+	packager = ${packager:-$(echo "Unknow Packager")}
+EOF
+	fi
     # Campos opcionales
     print_array_field "license" "license"
     print_array_field "makedepends" "makedepends"
@@ -143,12 +200,13 @@ EOF
     print_array_field "provides" "provides"
     print_array_field "conflicts" "conflicts"
     print_array_field "noextract" "noextract"
-    print_array_field "options" "options"
     print_array_field "replaces" "replaces"
+    print_array_field "options" "options"
     # Fuentes (simple)
     for src in "${source[@]}"; do
         echo "	source = $src"
     done
+    print_array_field "sha512sums" "sha512sums"
     print_array_field "sha256sums" "sha256sums"
     print_array_field "b2sums" "b2sums"
     # Fuentes (x86_64)
@@ -161,10 +219,202 @@ EOF
         echo "	source_aarch64 = $src"
     done
     print_array_field "sha256sums_aarch64" "sha256sums_aarch64"
-    cat <<EOF
+    
+    echo ""
+    
+# Iteramos si es un paquete split para completar el SRCINFO
+############################################################
 
+if [ "$SPLITPACKAGE" != "" ]; then
+	if [ -n "${pkgdesc+x}" ]; then
+	# Guardamos pkgdesc para que no se acumule
+	origdesc=$pkgdesc
+	fi
+	for package in $SPLITPACKAGE;do
+	echo "pkgname = $package"
+	
+	# Definimos la descripcion tanto si es pkgdesc o pkgdesc+
+	##########################################################
+	# Buscar asignación no acumulativa: pkgdesc=
+	func_block=$(awk "/^package_$package\(\) \{/,/^}/" PKGBUILD)
+	# Buscar asignación simple: pkgdesc=
+	if pkgdesc_line=$(echo "$func_block" | grep -E '^[[:space:]]*pkgdesc='); then
+		# Extraer el valor después del '=' y limpiar comillas
+		pkgdesc_value=$(echo "$pkgdesc_line" | sed -E "s/^[[:space:]]*pkgdesc=[\"']?//; s/[\"']?[[:space:]]*$//")
+		echo "	pkgdesc = ${pkgdesc_value:-$origdesc}"
+	else
+		pkgdesc_value=""
+		#echo "	pkgdesc = $origdesc"
+	fi
+
+	# Buscar asignación acumulativa: pkgdesc+=
+	if pkgdesc_plus_line=$(echo "$func_block" | grep -E '^[[:space:]]*pkgdesc\+='); then
+		# Extraer el valor después del '+=' y limpiar comillas
+		pkgdesc_plus_value=$(echo "$pkgdesc_plus_line" | sed -E "s/^[[:space:]]*pkgdesc\+=[\"']?//; s/[\"']?[[:space:]]*$//")
+		cpkgdesc=$origdesc$pkgdesc_plus_value
+		echo "	pkgdesc = ${cpkgdesc:-$origdesc}"
+	else
+		pkgdesc_plus_value=""
+		#echo "	pkgdesc = $origdesc"
+	fi
+
+	####
+	# Run function in sandbox
+	unset -v depends optdepends replaces conflicts provides install license
+	{
+		# comandos mas comunes
+		arch-meson() { :; };
+		cd() { :; };
+		cp() { :; };
+		cmake() { :; };
+		diff(){ :; };
+		find(){ :; };
+		file(){ :; };
+		install() { :; };
+		make() { :; };
+		meson() { :; };
+		mkdir() { :; };
+		mv() { :; };
+		ln() { :; };
+		patch(){ :; };
+		rm() { :; };
+		strip() { :; };
+		# funciones personalizadas
+		_install_component() { :; };
+		_pick() { :; }
+		
+		pkgdir="/tmp/pkgdir"; srcdir="/tmp/srcdir"; _archive="/tmp/archive"; startdir="/tmp/startdir"; file="/tmp/file"; builddir="/tmp/builddir"
+        
+        "package_$package" 2>/dev/null
+    }
+	####
+	# --------- get license ---------
+    readarray -t _new_lic < <(
+        "package_$package" 2>/dev/null
+        if declare -p license &>/dev/null 2>&1; then
+            printf '%s\n' "${license[@]}"
+        fi
+    )
+    local_license=()
+    if [[ ${#_new_lic[@]} -gt 0 ]]; then
+        if [[ ${#_new_lic[@]} -eq 1 && -z "${_new_lic[0]}" ]]; then
+            local_license=()
+        else
+            local_license=( "${_new_lic[@]}" )
+        fi
+    fi
+    print_array_field "license" "license"
+	
+	# --------- get install ---------
+    readarray -t _new_ins < <(
+        "package_$package" 2>/dev/null
+        if declare -p install &>/dev/null 2>&1; then
+            printf '%s\n' "${install[@]}"
+        fi
+    )
+    local_install=()
+    if [[ ${#_new_ins[@]} -gt 0 ]]; then
+        if [[ ${#_new_ins[@]} -eq 1 && -z "${_new_ins[0]}" ]]; then
+            local_install=()
+        else
+            local_install=( "${_new_ins[@]}" )
+        fi
+    fi
+    print_array_field "install" "local_install"
+	
+	# --------- get depends ---------
+    readarray -t _new_deps < <(
+        "package_$package" 2>/dev/null
+        if declare -p depends &>/dev/null 2>&1; then
+            printf '%s\n' "${depends[@]}"
+        fi
+    )
+    local_depends=()
+    if [[ ${#_new_deps[@]} -gt 0 ]]; then
+        if [[ ${#_new_deps[@]} -eq 1 && -z "${_new_deps[0]}" ]]; then
+            local_depends=()
+        else
+            local_depends=( "${_new_deps[@]}" )
+        fi
+    fi
+    print_array_field "depends" "local_depends"
+    
+    # --------- get optdepends ---------
+    readarray -t _new_odeps < <(
+        "package_$package" 2>/dev/null
+        if declare -p optdepends &>/dev/null 2>&1; then
+            printf '%s\n' "${optdepends[@]}"
+        fi
+    )
+    local_optdepends=()
+    if [[ ${#_new_odeps[@]} -gt 0 ]]; then
+        if [[ ${#_new_odeps[@]} -eq 1 && -z "${_new_odeps[0]}" ]]; then
+            local_optdepends=()
+        else
+            local_optdepends=( "${_new_odeps[@]}" )
+        fi
+    fi
+    print_array_field "optdepends" "local_optdepends"
+    
+    # --------- get conflicts ---------
+    readarray -t _new_conf < <(
+        "package_$package" 2>/dev/null
+        if declare -p conflicts &>/dev/null 2>&1; then
+            printf '%s\n' "${conflicts[@]}"
+        fi
+    )
+    local_conflicts=()
+    if [[ ${#_new_conf[@]} -gt 0 ]]; then
+        if [[ ${#_new_conf[@]} -eq 1 && -z "${_new_conf[0]}" ]]; then
+            local_conflicts=()
+        else
+            local_conflicts=( "${_new_conf[@]}" )
+        fi
+    fi
+    print_array_field "conflicts" "local_conflicts"
+    
+    # --------- get replaces ---------
+    readarray -t _new_reps < <(
+        "package_$package" 2>/dev/null
+        if declare -p replaces &>/dev/null 2>&1; then
+            printf '%s\n' "${replaces[@]}"
+        fi
+    )
+    local_replaces=()
+    if [[ ${#_new_reps[@]} -gt 0 ]]; then
+        if [[ ${#_new_reps[@]} -eq 1 && -z "${_new_reps[0]}" ]]; then
+            local_replaces=()
+        else
+            local_replaces=( "${_new_reps[@]}" )
+        fi
+    fi
+    print_array_field "replaces" "local_replaces"
+    
+    # --------- get provides ---------
+    readarray -t _new_prov < <(
+        "package_$package" 2>/dev/null
+        if declare -p provides &>/dev/null 2>&1; then
+            printf '%s\n' "${provides[@]}"
+        fi
+    )
+    local_provides=()
+    if [[ ${#_new_prov[@]} -gt 0 ]]; then
+        if [[ ${#_new_prov[@]} -eq 1 && -z "${_new_prov[0]}" ]]; then
+            local_provides=()
+        else
+            local_provides=( "${_new_prov[@]}" )
+        fi
+    fi
+    print_array_field "provides" "provides"
+    
+    ############
+	echo ""
+	done
+else
+	cat <<EOF
 pkgname = $pkgname
 EOF
+fi
 }
 
 # Modo --printsrcinfo: imprimir y salir
@@ -260,7 +510,7 @@ EOF
 [[ -z ${pkgver:-} ]] && error "pkgver no definido."
 [[ -z ${pkgrel:-} ]] && error "pkgrel no definido."
 
-readonly pkgfile="${pkgname}-${pkgver}-${pkgrel}-${CARCH}${PKGEXT}"
+pkgfile="${pkgname}-${pkgver}-${pkgrel}-${CARCH}${PKGEXT}"
 
 # Limpiar entorno
 log "Limpiando directorios anteriores..."
