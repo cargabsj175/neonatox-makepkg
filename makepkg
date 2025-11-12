@@ -1,7 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-
 # === Opciones de línea de comandos ===
 workdir="$PWD"
 printsrcinfo=false
@@ -79,7 +78,6 @@ SRCDIR="$PWD/src"
 BUILDDIR="$PWD/build"
 PKGDIR="$PWD/pkg"
 PKGEXT=".pkg.tar.zst"
-CARCH="$(uname -m)"
 
 # Colores
 RED='\033[0;31m'
@@ -88,11 +86,11 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 log() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}\t**INFO:${NC} $1"
 }
 
 error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
+    echo -e "${RED}\t**ERROR:${NC} $1" >&2
     exit 1
 }
 
@@ -102,14 +100,20 @@ error() {
 # Variables generales
 PKGBUILDSHA256=$(sha256sum PKGBUILD | sed 's/ PKGBUILD//g')
 BUILDDATE=$(date +%s)
-PACKAGETYPE=$(cat PKGBUILD | grep package | sed 's/ {//g')
+# Limitacion temporal en cueanto de desarrolla el soporte para paquetes Split
+PACKAGETYPE=$(cat PKGBUILD | grep "package()" | sed 's/ {//g') 
+## Basada en la configuracion por defecto del makepkg original
+CARCH="$(uname -m)"
+CHOST="$(echo "$MACHTYPE")"
+BUILDENV=(!distcc color !ccache check !sign)
+OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge debug lto)
 
-#log "Cargando PKGBUILD..."
+# Cargando PKGBUILD...
 source PKGBUILD
 
 # Verificar la condición
 if [ "$PACKAGETYPE" != "package()" ]; then
-    echo "Error: $(basename $0) only supports non-split PKGBUILD files..."
+    error "$(basename $0) only supports non-split PKGBUILD files..."
     exit 1
 fi
 
@@ -150,10 +154,9 @@ fi
 SPLITPACKAGE="${SPLITPACKAGE#"${SPLITPACKAGE%%[![:space:]]*}"}"
 
 ##############################
-# Funciones para metapaquetes
+# Funciones para crear archivos de metadatos
 ##############################
-generate_srcinfo() {
-    # Función auxiliar para imprimir array en formato SRCINFO
+	# Función auxiliar para imprimir array en formato SRCINFO
     print_array_field() {
         local field="$1"
         local var="$2"
@@ -162,9 +165,14 @@ generate_srcinfo() {
         fi
         eval 'local values=("${'"$var"'[@]}")'
         for val in "${values[@]}"; do
-            [[ -n "$val" ]] && echo "	$field = $val"
+            [[ -n "$val" ]] && echo "$field = $val"
         done
     }
+#####
+# Generar .SRCINFO
+#####
+generate_srcinfo() {
+# Inicio del archivo .SRCINFO
     cat <<EOF
 pkgbase = ${pkgbase:-$pkgname}
 EOF
@@ -180,8 +188,8 @@ EOF
 	cat <<EOF
 	url = $url
 EOF
-	print_array_field "arch" "arch"
-	print_array_field "groups" "groups"
+	print_array_field "	arch" "arch"
+	print_array_field "	groups" "groups"
 	if [ -n "${epoch+x}" ]; then
     cat <<EOF
 	epoch = $epoch
@@ -193,22 +201,22 @@ EOF
 EOF
 	fi
     # Campos opcionales
-    print_array_field "license" "license"
-    print_array_field "makedepends" "makedepends"
-    print_array_field "depends" "depends"
-    print_array_field "optdepends" "optdepends"
-    print_array_field "provides" "provides"
-    print_array_field "conflicts" "conflicts"
-    print_array_field "noextract" "noextract"
-    print_array_field "replaces" "replaces"
-    print_array_field "options" "options"
+    print_array_field "	license" "license"
+    print_array_field "	makedepends" "makedepends"
+    print_array_field "	depends" "depends"
+    print_array_field "	optdepends" "optdepends"
+    print_array_field "	provides" "provides"
+    print_array_field "	conflicts" "conflicts"
+    print_array_field "	noextract" "noextract"
+    print_array_field "	replaces" "replaces"
+    print_array_field "	options" "options"
     # Fuentes (simple)
     for src in "${source[@]}"; do
         echo "	source = $src"
     done
-    print_array_field "sha512sums" "sha512sums"
-    print_array_field "sha256sums" "sha256sums"
-    print_array_field "b2sums" "b2sums"
+    print_array_field "	sha512sums" "sha512sums"
+    print_array_field "	sha256sums" "sha256sums"
+    print_array_field "	b2sums" "b2sums"
     # Fuentes (x86_64)
     for src in "${source_x86_64[@]}"; do
         echo "	source_x86_64 = $src"
@@ -303,7 +311,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_license=( "${_new_lic[@]}" )
         fi
     fi
-    print_array_field "license" "license"
+    print_array_field "	license" "license"
 	
 	# --------- get install ---------
     readarray -t _new_ins < <(
@@ -320,7 +328,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_install=( "${_new_ins[@]}" )
         fi
     fi
-    print_array_field "install" "local_install"
+    print_array_field "	install" "local_install"
 	
 	# --------- get depends ---------
     readarray -t _new_deps < <(
@@ -337,7 +345,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_depends=( "${_new_deps[@]}" )
         fi
     fi
-    print_array_field "depends" "local_depends"
+    print_array_field "	depends" "local_depends"
     
     # --------- get optdepends ---------
     readarray -t _new_odeps < <(
@@ -354,7 +362,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_optdepends=( "${_new_odeps[@]}" )
         fi
     fi
-    print_array_field "optdepends" "local_optdepends"
+    print_array_field "	optdepends" "local_optdepends"
     
     # --------- get conflicts ---------
     readarray -t _new_conf < <(
@@ -371,7 +379,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_conflicts=( "${_new_conf[@]}" )
         fi
     fi
-    print_array_field "conflicts" "local_conflicts"
+    print_array_field "	conflicts" "local_conflicts"
     
     # --------- get replaces ---------
     readarray -t _new_reps < <(
@@ -388,7 +396,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_replaces=( "${_new_reps[@]}" )
         fi
     fi
-    print_array_field "replaces" "local_replaces"
+    print_array_field "	replaces" "local_replaces"
     
     # --------- get provides ---------
     readarray -t _new_prov < <(
@@ -405,7 +413,7 @@ if [ "$SPLITPACKAGE" != "" ]; then
             local_provides=( "${_new_prov[@]}" )
         fi
     fi
-    print_array_field "provides" "provides"
+    print_array_field "	provides" "provides"
     
     ############
 	echo ""
@@ -415,15 +423,19 @@ else
 pkgname = $pkgname
 EOF
 fi
+# Fin del archivo .SRCINFO
 }
-
-# Modo --printsrcinfo: imprimir y salir
+# Argumento --printsrcinfo: imprimir y salir
 if [[ "$printsrcinfo" == true ]]; then
     generate_srcinfo
     exit 0
 fi
 
+#####
+# Generar .PKGINFO
+#####
 generate_pkginfo() {
+# Inicio del archivo .PKGINFO   
 	cat <<EOF
 # Generated by $(basename $0)
 pkgname = $pkgname
@@ -433,54 +445,30 @@ pkgver = $pkgver-$pkgrel
 pkgdesc = $pkgdesc
 url = $url
 builddate = $BUILDDATE
-packager = ${packager:-$(whoami)}
+packager = ${packager:-$(echo "Unknow Packager")}
 size = $(echo $(du -sb "$PKGDIR" | cut -f1))
-arch = $(uname -m)
+arch = $CARCH
 EOF
-
-# Función auxiliar: escribe un campo que puede ser array o string
-write_pkginfo_array_field() {
-    local field_name="$1"
-    local var_name="$2"
-
-    # Si la variable no está definida, salir
-    if ! eval '[[ -v '"$var_name"' ]]' >/dev/null 2>&1; then
-        return
-    fi
-
-    # Extraer valores (funciona tanto para arrays como para strings)
-    eval 'local _vals=("${'"$var_name"'[@]}")'
-
-    for _v in "${_vals[@]}"; do
-        # Saltar elementos vacíos
-        [[ -n "$_v" ]] || continue
-        # Si el campo es optdepends y el elemento contiene ':' o ' - ', dejar tal cual (ej: "pkg: descripción")
-        echo "$field_name = $_v" >> "$PKGDIR/.PKGINFO"
-    done
+print_array_field "license" "license"
+print_array_field "depend" "depends"
+print_array_field "optdepend" "optdepends"
+print_array_field "makedepend" "makedepends"
+print_array_field "provides" "provides"
+print_array_field "conflicts" "conflicts"
+print_array_field "replaces" "replaces"
+# Fin del archivo .PKGINFO   
 }
-
-# Campos en el orden deseado por pacman (salteables si no existen)
-# license (puede ser array o string)
-write_pkginfo_array_field "license" "license"
-# depends
-write_pkginfo_array_field "depend" "depends"
-# optdepends (opcional)
-write_pkginfo_array_field "optdepend" "optdepends"
-# makedepends (opcional)
-write_pkginfo_array_field "makedepend" "makedepends"
-# provides, conflicts, replaces (cada uno opcional)
-write_pkginfo_array_field "provides" "provides"
-write_pkginfo_array_field "conflicts" "conflicts"
-write_pkginfo_array_field "replaces" "replaces"
-	}
-
+#####
+# Generar .BUILDINFO
+#####
 generate_pkgbuild() {
+# Inicio del archivo .BUILDINFO   
 	cat  <<EOF
 format = 2
 pkgname = $pkgname
 pkgbase = ${pkgbase:-$pkgname}
 pkgver = $pkgver-$pkgrel
-pkgarch = $(uname -m)
+pkgarch = $CARCH
 pkgbuild_sha256sum = $PKGBUILDSHA256
 packager = ${packager:-$(whoami)}
 builddate = $BUILDDATE
@@ -488,21 +476,10 @@ builddir = $workdir
 startdir = $workdir
 buildtool = $(basename $0)
 buildtoolver = $ver
-buildenv = !distcc
-buildenv = color
-buildenv = !ccache
-buildenv = check
-buildenv = !sign
-options = strip
-options = docs
-options = !libtool
-options = !staticlibs
-options = emptydirs
-options = zipman
-options = purge
-options = debug
-options = lto
 EOF
+print_array_field "buildenv" "BUILDENV"
+print_array_field "options" "OPTIONS"
+# Fin del archivo .BUILDINFO   
 }
 
 # Validar metadatos básicos
@@ -804,6 +781,11 @@ extract_sources() {
                 unzip -q "$f" -d "$SRCDIR" || { log "ERROR: falló unzip $filename"; return 1; }
                 extracted=true
                 ;;
+            *.deb)
+				log "Extrayendo $filename"
+				bsdtar -xf "$f" -C "$SRCDIR" || { log "ERROR: falló bsdtar -xf $filename"; return 1; }
+				extracted=true
+				;;
             *)
                 log "Saltando $filename (tipo desconocido o no comprimido)"
                 ;;
@@ -903,10 +885,8 @@ fi
 # Metadatos mínimos (formato compatible con pacman, sin makedepends)
 log "Generando metadatos (.PKGINFO)..."
 generate_pkginfo > "$PKGDIR/.PKGINFO"
-
 log "Generando metadatos (.BUILDINFO)..."
 generate_pkgbuild > "$PKGDIR/.BUILDINFO"
-
 
 # .MTREE (mejor compatibilidad con pacman)
 if command -v bsdtar >/dev/null; then
@@ -915,7 +895,6 @@ if command -v bsdtar >/dev/null; then
 else
     log "Advertencia: bsdtar no encontrado. El paquete no tendrá .MTREE."
 fi
-
 
 if [[ "$noarchive" == true ]]; then
     log "Opción --noarchive activada: se omite la creación del paquete."
